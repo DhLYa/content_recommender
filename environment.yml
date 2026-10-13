@@ -1,0 +1,17 @@
+name: anime-recommender
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - scikit-surprise
+  - ipykernel
+  - nbconvert
+  - pip
+  - pip:
+      - sentence-transformers
