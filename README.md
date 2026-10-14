@@ -45,13 +45,12 @@ The current dataset has 10,000 seed users plus 1 manual user. The seed users cam
 - **Custom lists are skipped**, since they repeat entries from the status lists (Watching, Completed, …).
 - **Duplicate entries are merged.** AniList occasionally holds two entries for the same anime in one list, mostly on accounts from 2014–2015. The rated entry is kept, then the most recently updated, then the one with more progress.
 - **Kept per entry:** `status` (`COMPLETED`, `PLANNING`, `DROPPED`, `CURRENT`, `PAUSED`, `REPEATING`), `progress` (episodes watched) and `repeat` (rewatch count).
-- **Dates:** AniList's partial dates become `YYYY-MM-DD` (or `YYYY-MM` / `YYYY` when incomplete), and Unix timestamps become ISO UTC. These dates are only kept in the raw collection; the anonymised copy drops them (see [Privacy](#privacy)).
+- **Dates:** AniList's partial dates become `YYYY-MM-DD` (or `YYYY-MM` / `YYYY` when incomplete), and Unix timestamps become ISO UTC. The committed copy drops these dates and the anime titles (titles are in `anime_metadata.csv`) to stay under GitHub's 100 MB file limit.
 
 **User lists → `user_profiles.csv`** (one row per user, computed from their list)
 - Status counts: `Watching` (current + rewatching), `Completed`, `On-Hold` (paused), `Dropped`, `Plan to Watch` (planning), and `Total Entries`.
 - `Rewatched` is the sum of rewatch counts, `Episodes` the sum of episodes watched, and `Mean Score` the mean rating of rated entries.
 - `Days` comes from AniList's own watch-time statistic, and is empty when AniList has none for the account.
-- `Gender` is always empty, because AniList doesn't expose it.
 
 **Anime metadata → `anime_metadata.csv`** (one row per anime)
 - **Which anime:** the 15,000 anime rated most often in the collection plus the top 100 seed anime, fetched 50 per request.
@@ -59,7 +58,7 @@ The current dataset has 10,000 seed users plus 1 manual user. The seed users cam
 - `Type` is AniList's format in lower case (`tv`, `tv_short`, `movie`, `special`, `ova`, `ona`, `music`).
 - **Genres** (`Genre(s)`) come from AniList's fixed list of 19 genres, comma-separated.
 - **Themes** (`Theme(s)`): AniList has no separate themes, so these are its tags with a relevance of at least 60/100, excluding spoiler tags, most relevant first. The full tag list with relevance scores is kept in `tags` (`name:rank; …`).
-- **Synopsis:** MyAnimeList's synopsis where there is one, with its credit line (`[Written by MAL Rewrite]`, `(Source: …)`) removed. Anime without a MAL synopsis fall back to AniList's description, with HTML removed, entities decoded, and the `(Source: …)` credit cut along with any broadcast notes after it. `synopsis_source` records which was used, and AniList's text is kept in `synopsis_anilist` for comparison. The text stays out of git (see [Privacy](#privacy)).
+- **Synopsis:** MyAnimeList's synopsis where there is one, with its credit line (`[Written by MAL Rewrite]`, `(Source: …)`) removed. Anime without a MAL synopsis fall back to AniList's description, with HTML removed, entities decoded, and the `(Source: …)` credit cut along with any broadcast notes after it. `synopsis_source` records which was used, and AniList's text is kept in `synopsis_anilist` for comparison. The synopsis text is kept out of git in `anime_synopses.csv`; only the embeddings built from it are committed.
 - **Scores:** `Mean Rating` is AniList's mean score / 10. `Rank` and `Popularity` are AniList's all-time rankings, which only exist for top anime, so `Rank` is mostly empty. `score_distribution` holds AniList-wide score counts in 10-point buckets as JSON.
 - **Dates:** `Year` and `Season` (e.g. `spring 2023`) come from the release season, and `Start Date` / `End Date` are `dd/mm/yyyy` when the full date is known.
 
@@ -67,7 +66,7 @@ The current dataset has 10,000 seed users plus 1 manual user. The seed users cam
 - **Content-based features** for each anime, scaled by a weight before being combined:
   - episode count: log-scaled and standardised, weight 1;
   - `Type`: one-hot encoded, weight 1;
-  - genres: multi-hot encoded, weight 2;
+  - genres: multi-hot encoded, weight 2.5;
   - themes: multi-hot encoded, weight 1.75;
   - synopsis: a 384-dimension `all-MiniLM-L6-v2` sentence embedding, weight 3.5.
 - Content similarity is the cosine similarity of the weighted features.
@@ -87,15 +86,7 @@ The sample is not representative of AniList users:
 
 ### Privacy
 
-The raw collection (`data/raw/anilist/`) contains usernames, AniList user IDs and complete lists, and is gitignored. [`scripts/anonymise_users.py`](scripts/anonymise_users.py) writes the committed copy, `data/raw/anilist_anonymised/`:
-- Seed users get random IDs (`anon-00001`, …), and their usernames and AniList IDs are removed. The ID map stays in the gitignored `data/private/`.
-- Manual users keep their AniList username.
-
-- Dates (started, completed, updated, created) and anime titles are dropped from the ratings file. Dates are the main way an anonymised list could be matched back to a public profile, and dropping them keeps the file under GitHub's 100 MB limit: about 38 MB instead of 200 MB for 10,000 users. Titles are in `anime_metadata.csv`.
-
-- Synopsis text is moved out of `anime_metadata.csv` into `anime_synopses.csv`, which is gitignored, because it is mostly MyAnimeList's copyrighted text. Only the embeddings built from it (`artifacts/synopsis_embeddings.npy`) are committed, so the analysis runs from a fresh clone without the text.
-
-Even without dates, a long list of ratings can sometimes be matched to a public profile. Check AniList's and MyAnimeList's API terms of use before publishing any of this data.
+Usernames are replaced with random identifiers (`anon-00001`, …) by [`scripts/anonymise_users.py`](scripts/anonymise_users.py). Manual users keep their AniList username.
 
 ### Preprocessing
 
