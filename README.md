@@ -1,66 +1,151 @@
 # Anime Recommender
 
-User-based collaborative filtering, content-based filtering, a weighted hybrid and Surprise SVD on MyAnimeList ratings, all scored against simple baselines on the same held-out test set.
+User-based collaborative filtering, content-based filtering, a weighted hybrid and Surprise SVD on [AniList](https://anilist.co) ratings, all scored against simple baselines on the same held-out test set.
 
-MyAnimeList's built-in recommendations are based on popularity and on recent user-written recommendations, not on what an individual user has rated. This project tests how much personalised models improve on that, using ratings collected from MAL.
+## Background
 
-Originally built as a university data analytics coursework project. The code was reviewed and fixed afterwards (see [Changes](#changes-from-the-original-coursework-notebook)), so the results here differ from the original coursework report, which is not included.
+This started as a university data analytics coursework project built on a different dataset: ratings scraped from MyAnimeList (MAL). A later review of the code found problems in the original methods, some of them fundamental enough to change the results and the conclusions drawn from them, so the methods were rewritten (see [Issues in the original](#issues-in-the-original)).
+
+The project now uses AniList data only. Unlike the MAL data, which was collected with code outside this repo, the AniList data is collected by a notebook in this repo ([`anilist_ingestion.ipynb`](anilist_ingestion.ipynb)), so the dataset can be rebuilt from scratch. The original coursework report and the MAL data are not included.
+
+## Issues in the original
+
+Problems found in the coursework version, and how they were fixed:
+
+- **Collaborative filtering similarity was wrong.** Unrated anime were filled with 0 and the ratings masked with `> 0` *after* mean-centring, so only anime both users rated *above their own mean* counted. Every similarity was ≥ 0 and most users had several "perfect" (1.0) neighbours based on one or two shared anime. Now: mean-centred cosine over all co-rated anime (similarities can be negative), shrunk by `n_shared / (n_shared + 25)`, and ignored below 5 shared anime.
+- **CF neighbours didn't have to have rated the anime.** Neighbours were the top-n most similar users overall, so about 90% of predictions silently fell back to the user's mean. Now neighbours are picked per anime from the users who rated it.
+- **The hybrid mixed rating scales.** CF scores were on the 1–10 scale but content-based scores were `mean(similarity × rating)`, so CF always won and the "hybrid" output was just the CF list. Now both components predict ratings and are blended for every anime.
+- **The hybrid evaluation leaked test data.** It used user similarities computed from all ratings, test ratings included. Now evaluation only uses training ratings.
+- **Content-based errors were flattering.** Pairs it couldn't predict were dropped from the evaluation instead of counted. Now they fall back to a baseline and coverage is reported.
+- **Hyperparameters were tuned on the test set**, and models were scored on different splits with no baselines. Now every model is scored on one shared test set, neighbourhood sizes and the hybrid weight are tuned on a separate validation split, and three baselines are reported. Against those baselines, the original CF did *worse* than predicting each user's mean rating.
+- **The population comparison counted MAL's 0 ("watched, not scored") as a rating**, which put the population mean at 4.25 and led to the wrong conclusion that the sample wasn't representative.
+- Smaller fixes: a `StandardScaler` whose output was discarded, a file path that no longer existed, a "top 10" loop that read 9, uncapped predictions, `eval()` on stringified dicts, and an empty-string genre label created for missing values.
 
 ## Data
 
-**Collection.** The MAL API returned the 500 most popular anime. Their stats pages were scraped with Beautiful Soup for usernames, keeping only users who had scored the title. Collection was capped at 10,000 users by API limits. Each user's scored anime list was then fetched through the API, giving a 5,610 × 20,896 user-by-anime matrix. Metadata for each anime came from the API, and themes were scraped from each anime's page.
+### Collection
 
-**Population check.** The Kaggle [Anime Dataset 2023](https://www.kaggle.com/datasets/dbdmobile/myanimelist-dataset) user ratings (313,670 users once MAL's `0` = "not scored" entries are removed) are used to check that the sample is representative. The rating distributions are close: the mean rating is 7.38 in the sample and 7.43 in the population, and the median is 8 in both.
+[`anilist_ingestion.ipynb`](anilist_ingestion.ipynb) collects the data from the AniList GraphQL API:
 
-**Preprocessing.**
-- Usernames are replaced with random user IDs by `scripts/anonymise_users.py`. The original files with real usernames are not in this repo.
-- Duplicate users are removed: 5,610 rows become 5,034 users, 4,915 of whom have at least one rating.
-- The wide matrix is melted into ~1.39M `(user_id, anime_title, rating)` rows.
-- Users with fewer than 85 ratings and anime with fewer than 25 are dropped. This leaves 3,506 users, 5,535 anime and 1.26M ratings.
-- Users whose mean rating is above 9 are removed, since many users rate everything 10 as a checklist. This leaves **3,370 users** for modelling.
-- Sparsity falls from 98.68% to 93.45%.
-- 72% of the remaining anime (3,977 of 5,535) have metadata. The content-based model falls back to the baseline for the rest.
+1. **Seed anime**: the top 500 anime by score.
+2. **Users**: for each seed anime, up to 50 users who have scored it, until `MAX_USERS` unique users are found.
+3. **Manual users**: specific users added by name (people of interest). They are always fetched and marked `source = "manual"`.
+4. **User lists**: every entry on each user's anime list, with scores on AniList's 1–100 scale (rescaled to 1–10 for the models).
+5. **Anime metadata**: the 15,000 anime rated most often in the collection plus the top 100 seed anime. This covers format, episodes, genres, tags, studios, scores and description, and keeps the MAL ID for cross-referencing.
+6. **MAL synopses**: AniList's descriptions are often short, so each anime's synopsis is looked up on MyAnimeList by its MAL ID. The source is the official MAL API when a `MAL_CLIENT_ID` environment variable is set (a free client ID from [myanimelist.net/apiconfig](https://myanimelist.net/apiconfig)), otherwise [Jikan](https://jikan.moe), an unofficial MAL API that needs no key. Some VPNs are blocked by Jikan; the stage detects this and stops with a message.
+
+Requests are throttled to AniList's current limit (30/min) with retries and backoff. Every stage checkpoints to disk, so a collection can run over several sessions and be interrupted safely, and each stage is validated before the next.
+
+The current dataset has 10,000 seed users plus 1 manual user. The seed users came from 241 of the 282 highest-rated anime, the ones searched before `MAX_USERS` was reached. 518 seed users had private lists, which leaves **9,483 lists, 7,485,213 list entries and 4,557,327 ratings** across 20,700 anime.
+
+### How the collected data is transformed
+
+**List entries → `ratings.csv.gz`** (one row per user and anime)
+- **Scores** are requested on AniList's 1–100 scale (`score`), whatever scale each user rates in, and rescaled to `rating = score / 10` (0.1–10). A score of 0 means *unrated*: `is_rated` is false and `rating` is empty. The analysis only uses rated entries.
+- **Custom lists are skipped**, since they repeat entries from the status lists (Watching, Completed, …).
+- **Duplicate entries are merged.** AniList occasionally holds two entries for the same anime in one list, mostly on accounts from 2014–2015. The rated entry is kept, then the most recently updated, then the one with more progress.
+- **Kept per entry:** `status` (`COMPLETED`, `PLANNING`, `DROPPED`, `CURRENT`, `PAUSED`, `REPEATING`), `progress` (episodes watched) and `repeat` (rewatch count).
+- **Dates:** AniList's partial dates become `YYYY-MM-DD` (or `YYYY-MM` / `YYYY` when incomplete), and Unix timestamps become ISO UTC. These dates are only kept in the raw collection; the anonymised copy drops them (see [Privacy](#privacy)).
+
+**User lists → `user_profiles.csv`** (one row per user, computed from their list)
+- Status counts: `Watching` (current + rewatching), `Completed`, `On-Hold` (paused), `Dropped`, `Plan to Watch` (planning), and `Total Entries`.
+- `Rewatched` is the sum of rewatch counts, `Episodes` the sum of episodes watched, and `Mean Score` the mean rating of rated entries.
+- `Days` comes from AniList's own watch-time statistic, and is empty when AniList has none for the account.
+- `Gender` is always empty, because AniList doesn't expose it.
+
+**Anime metadata → `anime_metadata.csv`** (one row per anime)
+- **Which anime:** the 15,000 anime rated most often in the collection plus the top 100 seed anime, fetched 50 per request.
+- `Title` is the romaji title. English and native titles, the MAL ID, studios (main studios only), source material, duration and airing status are kept as extra columns.
+- `Type` is AniList's format in lower case (`tv`, `tv_short`, `movie`, `special`, `ova`, `ona`, `music`).
+- **Genres** (`Genre(s)`) come from AniList's fixed list of 19 genres, comma-separated.
+- **Themes** (`Theme(s)`): AniList has no separate themes, so these are its tags with a relevance of at least 60/100, excluding spoiler tags, most relevant first. The full tag list with relevance scores is kept in `tags` (`name:rank; …`).
+- **Synopsis:** MyAnimeList's synopsis where there is one, with its credit line (`[Written by MAL Rewrite]`, `(Source: …)`) removed. Anime without a MAL synopsis fall back to AniList's description, with HTML removed, entities decoded, and the `(Source: …)` credit cut along with any broadcast notes after it. `synopsis_source` records which was used, and AniList's text is kept in `synopsis_anilist` for comparison. The text stays out of git (see [Privacy](#privacy)).
+- **Scores:** `Mean Rating` is AniList's mean score / 10. `Rank` and `Popularity` are AniList's all-time rankings, which only exist for top anime, so `Rank` is mostly empty. `score_distribution` holds AniList-wide score counts in 10-point buckets as JSON.
+- **Dates:** `Year` and `Season` (e.g. `spring 2023`) come from the release season, and `Start Date` / `End Date` are `dd/mm/yyyy` when the full date is known.
+
+**In the analysis** ([`anime_recommender.ipynb`](anime_recommender.ipynb))
+- **Content-based features** for each anime, scaled by a weight before being combined:
+  - episode count: log-scaled and standardised, weight 1;
+  - `Type`: one-hot encoded, weight 1;
+  - genres: multi-hot encoded, weight 2;
+  - themes: multi-hot encoded, weight 1.75;
+  - synopsis: a 384-dimension `all-MiniLM-L6-v2` sentence embedding, weight 3.5.
+- Content similarity is the cosine similarity of the weighted features.
+- `score_distribution` is summed over the sampled anime to compare the sample's ratings with AniList as a whole.
+- Ratings are matched to metadata by AniList anime ID.
+
+### Sampling bias
+
+The sample is not representative of AniList users:
+
+- **Users come from top-rated anime**, so they lean towards active, engaged users with long lists (median 343 ratings per user).
+- **The sample is dominated by early accounts.** For a given anime, AniList's API only returns the first 5,000 list entries, oldest first, and ignores sorting and date filters on that query. Users are taken from random pages within that window, but it can't reach past it. The median sampled account has an AniList ID of about 236,000, and 63% have IDs below 500,000, against roughly 7.9 million accounts in total.
+- **Users rate lower than AniList as a whole.** On the same anime, the sample's mean rating is about 7.1 against 7.6 for all AniList users (median 7 vs 8), with a similar spread (`figures/sample_vs_anilist_ratings.png`).
+- **The seed anime shape the sample.** Every seed user has scored at least one of the 282 highest-rated anime (e.g. *Sousou no Frieren*, *Gintama*, *Fullmetal Alchemist: Brotherhood*).
+- **Private lists are missing** (5% of the users found), and only users who scored the seed anime are taken.
+- **Manual users are hand-picked**, so they are excluded from the sample statistics. They are kept in the models and exempt from the user filters, so they always get recommendations.
+
+### Privacy
+
+The raw collection (`data/raw/anilist/`) contains usernames, AniList user IDs and complete lists, and is gitignored. [`scripts/anonymise_users.py`](scripts/anonymise_users.py) writes the committed copy, `data/raw/anilist_anonymised/`:
+- Seed users get random IDs (`anon-00001`, …), and their usernames and AniList IDs are removed. The ID map stays in the gitignored `data/private/`.
+- Manual users keep their AniList username.
+
+- Dates (started, completed, updated, created) and anime titles are dropped from the ratings file. Dates are the main way an anonymised list could be matched back to a public profile, and dropping them keeps the file under GitHub's 100 MB limit: about 38 MB instead of 200 MB for 10,000 users. Titles are in `anime_metadata.csv`.
+
+- Synopsis text is moved out of `anime_metadata.csv` into `anime_synopses.csv`, which is gitignored, because it is mostly MyAnimeList's copyrighted text. Only the embeddings built from it (`artifacts/synopsis_embeddings.npy`) are committed, so the analysis runs from a fresh clone without the text.
+
+Even without dates, a long list of ratings can sometimes be matched to a public profile. Check AniList's and MyAnimeList's API terms of use before publishing any of this data.
+
+### Preprocessing
+
+- Unscored list entries (planned, dropped or watched without a score) are not ratings and are dropped.
+- Users with fewer than 85 ratings and anime with fewer than 25 are dropped (manual users are kept). This leaves 8,503 users, 10,704 anime and 4,427,738 ratings.
+- Users whose mean rating is above 9 are removed, since rating nearly everything 9–10 says little about taste. This leaves **8,276 users** for modelling.
+- Sparsity falls from 97.67% to 95.09%.
+- All 10,704 remaining anime have metadata (the metadata covers the 15,000 anime rated most often).
 
 ## Results
 
-All models are scored on the same test set: 20% of each user's ratings. k and the hybrid weight were tuned on a validation split carved out of the training data.
+All models are scored on the same test set: 20% of each user's ratings. k and the hybrid weight were tuned on a validation split carved out of the training data. Ratings are on a 1–10 scale.
 
 | Model | MAE | RMSE | Coverage |
 |---|---|---|---|
-| SVD (tuned: 150 factors, lr 0.005, reg 0.1) | 0.871 | 1.176 | 100% |
-| Weighted hybrid (0.8 CF / 0.2 content) | 0.889 | 1.200 | 100% |
-| User-based CF (k = 50) | 0.904 | 1.218 | 100% |
-| *Baseline: user mean + item bias* | 0.948 | 1.272 | 100% |
-| Content-based (k = 20) | 1.027 | 1.372 | 91.8% |
-| *Baseline: user mean* | 1.113 | 1.469 | 100% |
-| *Baseline: global mean* | 1.296 | 1.678 | 100% |
+| SVD (default: 100 factors, lr 0.005, reg 0.02) | 0.872 | 1.203 | 100% |
+| SVD (grid search: 150 factors, lr 0.005, reg 0.1) | 0.892 | 1.217 | 100% |
+| Weighted hybrid (0.7 CF / 0.3 content) | 0.905 | 1.238 | 100% |
+| User-based CF (k = 30) | 0.936 | 1.271 | 99.6% |
+| *Baseline: user mean + item bias* | 0.997 | 1.347 | 100% |
+| Content-based (k = 10) | 1.050 | 1.433 | 100% |
+| *Baseline: user mean* | 1.194 | 1.585 | 100% |
+| *Baseline: global mean* | 1.414 | 1.859 | 100% |
 
-Coverage is the share of test ratings a model predicted itself rather than handing to the baseline.
+Coverage is the share of test ratings a model predicted itself rather than handing to the baseline. The content-based and hybrid results above use AniList's descriptions; they will change slightly once the MAL synopses are fetched and the embeddings rebuilt.
 
-The hybrid beats both of its components, but most of its accuracy comes from CF. Content-based filtering does worse than the user mean + item bias baseline, even on the pairs it covers. It adjusts the user's mean using only their own ratings of similar anime and ignores how each anime is rated overall. Basing both kNN models on the user + item baseline (Koren's kNN-baseline) is the obvious next step.
+SVD is the most accurate model. Its grid search (3-fold cross-validation on the training data) picked a more regularised configuration that did slightly *worse* on the test set than the defaults, so tuning it on the validation split like the other models would be a fairer comparison. The hybrid beats both of its components. On its own, content-based filtering does worse than the user mean + item bias baseline: it adjusts the user's mean using only their own ratings of similar anime, and ignores how each anime is rated overall. Basing both kNN models on the user + item baseline (Koren's kNN-baseline) is the obvious next step.
 
 ## Layout
 
 ```
 content_recommender/
+├── anilist_ingestion.ipynb              # collects the AniList data (resumable, rate-limited)
 ├── anime_recommender.ipynb              # EDA, preprocessing, models, evaluation
 ├── environment.yml                      # conda environment
 ├── data/
 │   ├── raw/
-│   │   ├── user_anime_ratings_wide.csv.gz  # one row per MAL user, one column per anime
-│   │   ├── anime_metadata.csv           # type, genres, themes, episodes, synopsis per anime
-│   │   └── user_profiles.csv            # MAL profile stats (gender, days watched, ...)
-│   ├── private/                         # not in git: original files with usernames, username -> ID map
-│   ├── external/
-│   │   ├── population_rating_counts.csv       # Kaggle "Anime Dataset 2023" rating histogram
-│   │   └── population_user_mean_ratings.csv   # ... and per-user mean ratings
-│   └── processed/
-│       └── ratings_long_filtered.csv    # generated: filtered (user_id, anime_title, rating)
-├── artifacts/                           # generated: synopsis embeddings, top-15 similar anime
+│   │   ├── anilist/                     # not in git: raw collection with usernames + checkpoints
+│   │   └── anilist_anonymised/
+│   │       ├── ratings.csv.gz           # one row per list entry (user_id, anime_id, score, rating, status, ...)
+│   │       ├── anime_metadata.csv       # format, genres, themes (tags), episodes, scores per anime (no synopsis text)
+│   │       ├── anime_synopses.csv       # not in git: synopsis text (MAL, or AniList as fallback)
+│   │       ├── user_profiles.csv        # per-user list statistics (status counts, episodes, mean score)
+│   │       └── users.csv                # every user found, with source and status
+│   ├── private/                         # not in git: AniList ID -> anonymised ID map
+│   └── processed/                       # not in git: generated filtered ratings
+├── artifacts/                           # synopsis embeddings and their anime IDs (committed), top-15 similar anime
 ├── figures/                             # generated: EDA plots
 └── scripts/
-    ├── anonymise_users.py               # writes data/raw user files from data/private with random IDs
-    ├── build_population_summary.py      # rebuilds data/external from the 1.5 GB Kaggle file
+    ├── anonymise_users.py               # anonymised copy of the collection (manual users keep their names)
     └── build_synopsis_embeddings.py     # encodes synopses into artifacts/ (run by the notebook if missing)
 ```
 
@@ -71,32 +156,26 @@ conda env create -f environment.yml
 conda activate anime-recommender
 ```
 
-Open `anime_recommender.ipynb` with the `anime-recommender` environment as the kernel and run all cells from this folder. A full run takes a few minutes with the synopsis embeddings cached.
+1. **Collect** (optional, the anonymised data and the synopsis embeddings are included): open `anilist_ingestion.ipynb`, set `TEST_MODE = False` and the sample size in the config cell, and run all cells. Rerunning continues where it stopped. Allow about 45 minutes per 1,000 users plus the MAL synopses (see [Run times](#run-times)). To use the official MAL API for synopses, set `MAL_CLIENT_ID` in the environment before starting Jupyter.
+2. **Anonymise**: `python scripts/anonymise_users.py`
+3. **Analyse**: open `anime_recommender.ipynb` with the `anime-recommender` environment as the kernel and run all cells from the repo root. A full run takes a couple of minutes once the synopsis embeddings are cached.
 
-The synopsis embeddings are cached in `artifacts/synopsis_embeddings.npy`. If the file is missing, the notebook runs `scripts/build_synopsis_embeddings.py` to rebuild it, downloading the `all-MiniLM-L6-v2` model on first use. That step runs in a separate process because on Windows, pip's `torch` and conda's MKL crash when loaded into the same Python process. Don't import `torch` in the notebook kernel.
+The synopsis embeddings are cached in `artifacts/synopsis_embeddings.npy`, with the anime IDs they belong to in `artifacts/synopsis_embedding_ids.npy`. If either file is missing, the notebook runs `scripts/build_synopsis_embeddings.py` to rebuild them from `anime_synopses.csv`, downloading the `all-MiniLM-L6-v2` model on first use. Delete `synopsis_embeddings.npy` after the synopses change (for example after fetching MAL synopses), since changed text isn't detected automatically. That step runs in a separate process because on Windows, pip's `torch` and conda's MKL crash when loaded into the same Python process. Don't import `torch` in the notebook kernel.
 
-## Changes from the original coursework notebook
+### Run times
 
-**Collaborative filtering**
-- The similarity is computed over anime both users rated. The original filled unrated anime with 0 and kept only anime both users rated above their own mean, so every similarity was ≥ 0 and many were exactly 1 from one or two shared anime.
-- Similarities are shrunk when users share few anime, and pairs sharing fewer than 5 anime are ignored.
-- Neighbours are picked per anime from the users who rated it. Before, they were the top-n users overall, so about 90% of predictions silently fell back to the user's mean.
+Measured on the 10,000-user collection (Windows desktop, CPU only):
 
-**Content-based**
-- Predictions are on the 1–10 rating scale: the user's mean plus the similarity-weighted average of their mean-centred ratings of the most similar anime they rated. Before, the score was the average of similarity × rating.
-- Pairs that cannot be predicted fall back to the baseline instead of being dropped, and coverage is reported.
+| Step | Time | Notes |
+|---|---|---|
+| Seed anime + user discovery | 64 min | 282 seed anime searched, 1–3 requests each |
+| User lists | 6.4 h | One request per user, about 2.3 s each |
+| Anime metadata | ~5 min | ~110 requests of 50 anime (measured for 5,000; 15,000 takes about 3× as long) |
+| MAL synopses | ~5 h (estimate) | One request per anime with a MAL ID (~15,000) at 50/min |
+| Validation and assembly | ~3 min | Also the time for a rerun of a finished collection, which makes no requests |
+| Anonymisation | ~1 min | |
+| Synopsis embeddings | ~1.5 min | 15,000 synopses; cached afterwards |
+| Analysis notebook | ~7 min | Half of it is the SVD grid search |
+| **Total from scratch** | **~13 h** | Mostly user lists (about 45 minutes per 1,000 users) and MAL synopses |
 
-**Hybrid**
-- It blends two rating-scale predictions for every anime. Before, it combined scores on different scales, so the CF list always won.
-- Evaluation uses training-only CF similarities. Before, the similarities were built from all ratings, including the test ratings.
-
-**Evaluation**
-- All models are scored on one shared train/test split.
-- Hyperparameters (k, hybrid weight) are tuned on a validation split taken from the training data instead of on the test set.
-- Global-mean, user-mean and user-mean + item-bias baselines are added.
-
-**Smaller fixes**
-- The population comparison excludes MAL's `0` ("not scored") ratings.
-- A data path that no longer existed is fixed, and a dead `StandardScaler` is removed.
-- An empty-string genre/theme label is no longer created for missing values.
-- `eval` on stringified dicts is replaced by a NumPy similarity matrix, and duplicate metadata titles are de-duplicated.
+The collection ran with `REQUESTS_PER_MINUTE = 45`. AniList answered that with 361 rate-limit responses, and the notebook waited out each one. The effective rate came out at about 26 requests/minute, *slower* than the 30/min AniList currently allows, so leave it at 30. At a steady 30/min, user lists take 2 s each, about 5.5 h for 10,000 users.
