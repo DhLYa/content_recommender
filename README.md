@@ -65,13 +65,16 @@ The current dataset has 10,000 seed users plus 1 manual user. The seed users cam
 **In the analysis** ([`anime_recommender.ipynb`](anime_recommender.ipynb))
 - **Content-based features** for each anime, scaled by a weight before being combined:
   - episode count: log-scaled and standardised, weight 1;
-  - `Type`: one-hot encoded, weight 1;
+  - `Type`: one-hot encoded, weight 0.25;
   - genres: multi-hot encoded, weight 2.5;
   - themes: multi-hot encoded, weight 1.75;
-  - synopsis: a 384-dimension `all-MiniLM-L6-v2` sentence embedding, weight 3.5.
+  - synopsis: a 384-dimension `all-MiniLM-L6-v2` sentence embedding, weight 3.
 - Content similarity is the cosine similarity of the weighted features.
 - `score_distribution` is summed over the sampled anime to compare the sample's ratings with AniList as a whole.
 - Ratings are matched to metadata by AniList anime ID.
+- **Both kNN models build on a baseline** (the kNN-baseline approach): a prediction is the user mean + item bias, plus the neighbours' average deviation from *their* baselines. Neighbours then only explain what the baseline doesn't.
+- **Per-user normalisation:** in user-based CF, each neighbour's deviation is divided by their own rating spread and multiplied by the target user's, since AniList users score on different scales (all converted to 1–100). In content-based filtering the neighbours are the user's own ratings, so this cancels out.
+- **SVD is tuned like the other models:** 36 configurations are trained on the tuning split, scored on the validation split, and the best is retrained on the full training set.
 
 ### Sampling bias
 
@@ -100,25 +103,34 @@ Usernames are replaced with random identifiers (`anon-00001`, …) by [`scripts/
 
 All models are scored on the same test set: 20% of each user's ratings. k and the hybrid weight were tuned on a validation split carved out of the training data. Ratings are on a 1–10 scale.
 
-| Model | MAE | RMSE | Coverage |
-|---|---|---|---|
-| SVD (default: 100 factors, lr 0.005, reg 0.02) | 0.872 | 1.203 | 100% |
-| SVD (grid search: 150 factors, lr 0.005, reg 0.1) | 0.892 | 1.217 | 100% |
-| Weighted hybrid (0.7 CF / 0.3 content) | 0.905 | 1.238 | 100% |
-| User-based CF (k = 30) | 0.936 | 1.271 | 99.6% |
-| *Baseline: user mean + item bias* | 0.997 | 1.347 | 100% |
-| Content-based (k = 10) | 1.050 | 1.433 | 100% |
-| *Baseline: user mean* | 1.194 | 1.585 | 100% |
-| *Baseline: global mean* | 1.414 | 1.859 | 100% |
+| Model | MAE | RMSE | Coverage | Recall@10 | NDCG@10 |
+|---|---|---|---|---|---|
+| SVD (tuned: 200 factors, 40 epochs, lr 0.005, reg 0.05) | 0.845 | 1.164 | 100% | 0.024 | 0.121 |
+| Weighted hybrid (0.7 CF / 0.3 content) | 0.873 | 1.200 | 100% | 0.020 | 0.109 |
+| SVD (default: 100 factors, 20 epochs, lr 0.005, reg 0.02) | 0.872 | 1.203 | 100% | 0.024 | 0.110 |
+| User-based CF (k = 50) | 0.880 | 1.211 | 100% | 0.016 | 0.091 |
+| Content-based (k = 20) | 0.913 | 1.249 | 100% | 0.018 | 0.096 |
+| *Baseline: user mean + item bias* | 0.997 | 1.347 | 100% | 0.016 | 0.070 |
+| *Baseline: user mean* | 1.194 | 1.585 | 100% | – | – |
+| *Baseline: global mean* | 1.414 | 1.859 | 100% | – | – |
+| *Baseline: most popular* | – | – | – | **0.063** | **0.312** |
 
-Coverage is the share of test ratings a model predicted itself rather than handing to the baseline. The content-based and hybrid results above use AniList's descriptions; they will change slightly once the MAL synopses are fetched and the embeddings rebuilt.
+Coverage is the share of test ratings a model predicted itself rather than handing to the baseline.
 
-SVD is the most accurate model. Its grid search (3-fold cross-validation on the training data) picked a more regularised configuration that did slightly *worse* on the test set than the defaults, so tuning it on the validation split like the other models would be a fairer comparison. The hybrid beats both of its components. On its own, content-based filtering does worse than the user mean + item bias baseline: it adjusts the user's mean using only their own ratings of similar anime, and ignores how each anime is rated overall. Basing both kNN models on the user + item baseline (Koren's kNN-baseline) is the obvious next step.
+**Ranking metrics.** For each of 1,000 sampled users, every anime they haven't rated in training is scored, and the top 10 are compared with their test ratings. An anime counts as relevant if the user rated it at or above their own mean rating. Recall@10 is the share of relevant anime that made the top 10. NDCG@10 also rewards placing them higher. The user and global means give every anime the same score for a user, so they can't rank.
+
+**Rating accuracy.** Building the kNN models on the user + item baseline made the biggest difference. Content-based filtering went from worse than the baseline (RMSE 1.433) to clearly better (1.249), and user-based CF improved from 1.271 to 1.211. SVD tuned on the validation split is now the most accurate model, ahead of its defaults; the earlier cross-validated grid search had picked a worse configuration. The hybrid beats both of its components.
+
+**Ranking.** Recommending the most popular anime wins easily on ranking, with NDCG@10 of 0.31 against 0.12 for the best model. This is a known gap between rating accuracy and top-N recommendation, not a bug:
+- The models rank by predicted *rating*, so their top 10 is full of highly rated but less watched anime.
+- The test set only contains anime users actually watched, which are mostly popular ones. A good but obscure suggestion the user hasn't seen can never count as a hit.
+
+Ranking on predicted rating weighted by popularity, or training on what users *watch* (every list entry, including unscored ones) rather than how they score it, would close the gap. Recall@10 is low for every model because users have about 59 relevant test anime each, so 10 recommendations can cover at most about 17% of them.
 
 ## Layout
 
 ```
-content_recommender/
+anime-recommender/
 ├── anilist_ingestion.ipynb              # collects the AniList data (resumable, rate-limited)
 ├── anime_recommender.ipynb              # EDA, preprocessing, models, evaluation
 ├── environment.yml                      # conda environment
@@ -166,7 +178,7 @@ Measured on the 10,000-user collection (Windows desktop, CPU only):
 | Validation and assembly | ~3 min | Also the time for a rerun of a finished collection, which makes no requests |
 | Anonymisation | ~1 min | |
 | Synopsis embeddings | ~1.5 min | 15,000 synopses; cached afterwards |
-| Analysis notebook | ~7 min | Half of it is the SVD grid search |
+| Analysis notebook | ~10 min | SVD grid search ~5 min, ranking metrics ~3 min |
 | **Total from scratch** | **~13 h** | Mostly user lists (about 45 minutes per 1,000 users) and MAL synopses |
 
 The collection ran with `REQUESTS_PER_MINUTE = 45`. AniList answered that with 361 rate-limit responses, and the notebook waited out each one. The effective rate came out at about 26 requests/minute, *slower* than the 30/min AniList currently allows, so leave it at 30. At a steady 30/min, user lists take 2 s each, about 5.5 h for 10,000 users.
