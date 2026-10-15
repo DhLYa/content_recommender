@@ -4,7 +4,7 @@ User-based collaborative filtering, content-based filtering, a weighted hybrid a
 
 ## Background
 
-This started as university coursework built on a different dataset from MyAnimeList (MAL). A later review of the code found problems in the original methods, so the dataset and methods were rewritten and updated (see [Issues in the original](#issues-in-the-original)).
+This started as university coursework built on a different dataset from MyAnimeList (MAL). A later review of the code found problems in the original methods, so the dataset and methods were rewritten and updated.
 
 The project now uses AniList data only. The AniList data is collected by [`anilist_ingestion.ipynb`](anilist_ingestion.ipynb), so the dataset can be rebuilt from scratch.
 
@@ -33,7 +33,7 @@ Requests are throttled to AniList's current limit (30/min) with retries and back
 The current dataset has:
 - 10,001 Total Users
     - 9,483 Total Users
-    - 518 Private Lists
+    - 518 Private Lists (unusable for ranking)
 - 20,700 retrieved anime
 - 7.49M list entries
 - 4.56M ratings
